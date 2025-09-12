@@ -34,11 +34,23 @@ func main() {
 			fmt.Println("Failed to read integer:", err)
 			return
 		}
+
+		// Seek to the start of page 1
+		databaseFile.Seek(100, 0)
+		page1 := make([]byte, pageSize)
+		_, err = databaseFile.Read(page1)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		numCells := binary.BigEndian.Uint16(page1[3:5])
+
 		// You can use print statements as follows for debugging, they'll be visible when running tests.
 		fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
 
 		// Uncomment this to pass the first stage
-		fmt.Printf("database page size: %v", pageSize)
+		fmt.Printf("database page size: %v\n", pageSize)
+		fmt.Printf("number of tables: %v\n", numCells)
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
