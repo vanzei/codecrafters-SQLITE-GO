@@ -1,14 +1,20 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
+	"strings"
 )
+
+type SQLiteSchemaRow struct {
+	_type    string // _type since type is a reserved keyword
+	name     string
+	tblName  string
+	rootPage int
+	sql      string
+}
 
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
@@ -16,43 +22,67 @@ func main() {
 	command := os.Args[2]
 
 	switch command {
-	case ".dbinfo":
+	case ".dbinfo", ".tables":
 		databaseFile, err := os.Open(databaseFilePath)
 		if err != nil {
 			log.Fatal(err)
 		}
 
+		// Read page size from bytes 16-17 of the database header
 		header := make([]byte, 100)
-
-		_, err = databaseFile.Read(header)
+		_, err = databaseFile.ReadAt(header, 0)
 		if err != nil {
 			log.Fatal(err)
 		}
+		pageSize := int(header[16])<<8 | int(header[17])
 
-		var pageSize uint16
-		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
-			fmt.Println("Failed to read integer:", err)
-			return
+		_, _ = databaseFile.Seek(100, io.SeekStart) // Skip the database header
+
+		pageHeader := parsePageHeader(databaseFile)
+
+		cellPointers := make([]uint16, pageHeader.numCells)
+		for i := 0; i < int(pageHeader.numCells); i++ {
+			cellPointers[i] = parseUInt16(databaseFile)
 		}
 
-		// Seek to the start of page 1
-		databaseFile.Seek(100, 0)
-		page1 := make([]byte, pageSize)
-		_, err = databaseFile.Read(page1)
-		if err != nil {
-			log.Fatal(err)
+		var sqliteSchemaRows []SQLiteSchemaRow
+		var tableNames []string
+
+		for _, cellPointer := range cellPointers {
+			_, _ = databaseFile.Seek(int64(cellPointer), io.SeekStart)
+			parseVarint(databaseFile) // number of bytes in payload
+			parseVarint(databaseFile) // rowid
+			record := parseRecord(databaseFile, 5)
+
+			sqliteSchemaRows = append(sqliteSchemaRows, SQLiteSchemaRow{
+				_type:    string(record.values[0].([]byte)),
+				name:     string(record.values[1].([]byte)),
+				tblName:  string(record.values[2].([]byte)),
+				rootPage: int(record.values[3].(uint8)),
+				sql:      string(record.values[4].([]byte)),
+			})
+
+			tableNames = append(tableNames, string(record.values[2].([]byte)))
 		}
-
-		numCells := binary.BigEndian.Uint16(page1[3:5])
-
-		// You can use print statements as follows for debugging, they'll be visible when running tests.
-		fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
-
-		// Uncomment this to pass the first stage
-		fmt.Printf("database page size: %v\n", pageSize)
-		fmt.Printf("number of tables: %v\n", numCells)
+		fmt.Println("database page size: ", pageSize)
+		//fmt.Println("Logs from your program will appear here!")
+		if command == ".dbinfo" {
+			fmt.Printf("number of tables: %v\n", len(sqliteSchemaRows))
+		} else {
+			fmt.Println(strings.Join(tableNames, " "))
+		}
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
 	}
+}
+
+// Alias for your parserHeader
+func parsePageHeader(databaseFile *os.File) PageHearder {
+	return parserHeader(databaseFile)
+}
+
+// Alias for your parserRecord
+func parseRecord(stream io.Reader, valuesCount int) Record {
+	return parserRecord(stream, valuesCount)
 }
