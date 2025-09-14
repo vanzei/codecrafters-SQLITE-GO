@@ -38,7 +38,7 @@ func main() {
 
 		_, _ = databaseFile.Seek(100, io.SeekStart) // Skip the database header
 
-		pageHeader := parsePageHeader(databaseFile)
+		pageHeader := parserHeader(databaseFile)
 
 		cellPointers := make([]uint16, pageHeader.numCells)
 		for i := 0; i < int(pageHeader.numCells); i++ {
@@ -52,7 +52,7 @@ func main() {
 			_, _ = databaseFile.Seek(int64(cellPointer), io.SeekStart)
 			parseVarint(databaseFile) // number of bytes in payload
 			parseVarint(databaseFile) // rowid
-			record := parseRecord(databaseFile, 5)
+			record := parserRecord(databaseFile, 5)
 
 			sqliteSchemaRows = append(sqliteSchemaRows, SQLiteSchemaRow{
 				_type:    string(record.values[0].([]byte)),
@@ -77,12 +77,12 @@ func main() {
 	}
 }
 
-// Alias for your parserHeader
-func parsePageHeader(databaseFile *os.File) PageHearder {
-	return parserHeader(databaseFile)
-}
+// // Alias for your parserHeader
+// func parsePageHeader(databaseFile *os.File) PageHearder {
+// 	return parserHeader(databaseFile)
+// }
 
-// Alias for your parserRecord
-func parseRecord(stream io.Reader, valuesCount int) Record {
-	return parserRecord(stream, valuesCount)
-}
+// // Alias for your parserRecord
+// func parseRecord(stream io.Reader, valuesCount int) Record {
+// 	return parserRecord(stream, valuesCount)
+// }
