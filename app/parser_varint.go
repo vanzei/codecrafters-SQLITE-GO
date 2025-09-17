@@ -26,6 +26,25 @@ func parseVarint(stream io.Reader) int {
 	return result
 }
 
+// New: returns both the value and the number of bytes consumed.
+func parseVarintWithLen(stream io.Reader) (int, int) {
+	result := 0
+	usable := readUsableBytesAsInts(stream)
+
+	for index, usableByteAsInt := range usable {
+		var usableSize int
+		if index == 8 {
+			usableSize = 8
+		} else {
+			usableSize = 7
+		}
+		shifted := result << usableSize
+		result = shifted + usableValue(usableSize, usableByteAsInt)
+	}
+
+	return result, len(usable)
+}
+
 func usableValue(usableSize int, usableByteAsInt int) int {
 	if usableSize == 8 {
 		return usableByteAsInt
