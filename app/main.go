@@ -101,39 +101,50 @@ func main() {
 			tableExpr := stmt.From[0]
 			tableName := sqlparser.String(tableExpr.(*sqlparser.AliasedTableExpr).Expr)
 
-			colExpr := stmt.SelectExprs[0]
-			colName := sqlparser.String(colExpr.(*sqlparser.AliasedExpr).Expr)
-
 			// Handle COUNT(*) special case
-			if strings.ToUpper(colName) == "COUNT(*)" {
-				var rootPage int
-				for _, row := range sqliteSchemaRows {
-					if row._type == "table" && row.name == tableName {
-						rootPage = row.rootPage
-						break
+			if len(stmt.SelectExprs) == 1 {
+				colExpr := stmt.SelectExprs[0]
+				colName := sqlparser.String(colExpr.(*sqlparser.AliasedExpr).Expr)
+				if strings.ToUpper(colName) == "COUNT(*)" {
+					var rootPage int
+					for _, row := range sqliteSchemaRows {
+						if row._type == "table" && row.name == tableName {
+							rootPage = row.rootPage
+							break
+						}
 					}
-				}
-				if rootPage == 0 {
-					fmt.Printf("table not found: %s\n", tableName)
-					os.Exit(1)
-				}
+					if rootPage == 0 {
+						fmt.Printf("table not found: %s\n", tableName)
+						os.Exit(1)
+					}
 
-				// Read table leaf page and count rows
-				const pageTypeTableLeaf = 0x0D
-				pageStart := int64((rootPage - 1) * pageSize)
-				_, _ = databaseFile.Seek(pageStart, io.SeekStart)
-				pageHeader := parserHeader(databaseFile)
-				if pageHeader.pageType != pageTypeTableLeaf {
-					log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
+					// Read table leaf page and count rows
+					const pageTypeTableLeaf = 0x0D
+					pageStart := int64((rootPage - 1) * pageSize)
+					_, _ = databaseFile.Seek(pageStart, io.SeekStart)
+					pageHeader := parserHeader(databaseFile)
+					if pageHeader.pageType != pageTypeTableLeaf {
+						log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
+					}
+					fmt.Println(pageHeader.numCells)
+					return
 				}
-				fmt.Println(pageHeader.numCells)
-				return
 			}
 
-			// Handle regular column selection
-			if len(stmt.SelectExprs) != 1 {
-				fmt.Println("Only single column SELECT statements are supported")
-				os.Exit(1)
+			// Parse requested columns
+			var requestedCols []string
+			for _, selectExpr := range stmt.SelectExprs {
+				switch expr := selectExpr.(type) {
+				case *sqlparser.AliasedExpr:
+					colName := sqlparser.String(expr.Expr)
+					requestedCols = append(requestedCols, colName)
+				case *sqlparser.StarExpr:
+					// Handle SELECT * - add all columns
+					requestedCols = []string{"*"}
+				default:
+					fmt.Println("Unsupported SELECT expression type")
+					os.Exit(1)
+				}
 			}
 
 			var (
@@ -161,42 +172,34 @@ func main() {
 				payloadCols = append(payloadCols, def.name)
 			}
 
-			// Handle special rowid column
-			if strings.ToLower(colName) == "rowid" {
-				// For rowid, we don't need to look in the payload, we can get it directly
-				const pageTypeTableLeaf = 0x0D
-				pageStart := int64((rootPage - 1) * pageSize)
-				_, _ = databaseFile.Seek(pageStart, io.SeekStart)
-				pageHeader := parserHeader(databaseFile)
-				if pageHeader.pageType != pageTypeTableLeaf {
-					log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
-				}
-
-				cellPointers := make([]uint16, pageHeader.numCells)
-				for i := 0; i < int(pageHeader.numCells); i++ {
-					cellPointers[i] = parseUInt16(databaseFile)
-				}
-
-				for _, cellPtr := range cellPointers {
-					_, _ = databaseFile.Seek(pageStart+int64(cellPtr), io.SeekStart)
-					_ = parseVarint(databaseFile)      // payload size
-					rowid := parseVarint(databaseFile) // rowid
-					fmt.Println(rowid)
-				}
-				return
+			// Handle SELECT *
+			if len(requestedCols) == 1 && requestedCols[0] == "*" {
+				requestedCols = make([]string, len(payloadCols))
+				copy(requestedCols, payloadCols)
 			}
 
-			// Find the column index
-			colIndex := -1
-			for i, c := range payloadCols {
-				if strings.ToLower(c) == strings.ToLower(colName) {
-					colIndex = i
-					break
+			// Find column indices
+			var colIndices []int
+			var isRowidCols []bool
+			for _, colName := range requestedCols {
+				if strings.ToLower(colName) == "rowid" {
+					colIndices = append(colIndices, -1) // Special marker for rowid
+					isRowidCols = append(isRowidCols, true)
+				} else {
+					colIndex := -1
+					for i, c := range payloadCols {
+						if strings.EqualFold(c, colName) {
+							colIndex = i
+							break
+						}
+					}
+					if colIndex == -1 {
+						fmt.Printf("no such column: %s\n", colName)
+						os.Exit(1)
+					}
+					colIndices = append(colIndices, colIndex)
+					isRowidCols = append(isRowidCols, false)
 				}
-			}
-			if colIndex == -1 {
-				fmt.Printf("no such column: %s\n", colName)
-				os.Exit(1)
 			}
 
 			// Read table leaf page
@@ -214,25 +217,40 @@ func main() {
 				cellPointers[i] = parseUInt16(databaseFile)
 			}
 
-			// For each row (cell), parse and print the requested column
+			// For each row (cell), parse and print the requested columns
 			for _, cellPtr := range cellPointers {
 				_, _ = databaseFile.Seek(pageStart+int64(cellPtr), io.SeekStart)
-				_ = parseVarint(databaseFile) // payload size (not used directly)
-				_ = parseVarint(databaseFile) // rowid (ignored)
+				_ = parseVarint(databaseFile)      // payload size (not used directly)
+				rowid := parseVarint(databaseFile) // rowid
 
 				rec := parserRecordDynamic(databaseFile)
-				if colIndex >= len(rec.values) {
-					// Safety check if schema parsing didn't match payload
-					fmt.Println("")
-					continue
+
+				// Print values for all requested columns
+				var values []string
+				for i, colIndex := range colIndices {
+					if isRowidCols[i] {
+						// This is the rowid column
+						values = append(values, fmt.Sprintf("%d", rowid))
+					} else {
+						if colIndex >= len(rec.values) {
+							// Safety check if schema parsing didn't match payload
+							values = append(values, "")
+							continue
+						}
+						v := rec.values[colIndex]
+						switch vv := v.(type) {
+						case nil:
+							values = append(values, "")
+						case []byte:
+							values = append(values, string(vv))
+						default:
+							values = append(values, fmt.Sprintf("%v", vv))
+						}
+					}
 				}
-				v := rec.values[colIndex]
-				switch vv := v.(type) {
-				case []byte:
-					fmt.Println(string(vv))
-				default:
-					fmt.Println(vv)
-				}
+
+				// Print row with pipe-separated values (or tab-separated)
+				fmt.Println(strings.Join(values, "|"))
 			}
 			return
 
