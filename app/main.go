@@ -126,7 +126,49 @@ func main() {
 					if pageHeader.pageType != pageTypeTableLeaf {
 						log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
 					}
-					fmt.Println(pageHeader.numCells)
+
+					// If there's a WHERE clause, we need to count matching rows
+					if stmt.Where != nil {
+						count := 0
+						// Read cell pointer array
+						cellPointers := make([]uint16, pageHeader.numCells)
+						for i := 0; i < int(pageHeader.numCells); i++ {
+							cellPointers[i] = parseUInt16(databaseFile)
+						}
+
+						// Get table schema for WHERE evaluation
+						var createSQL string
+						for _, row := range sqliteSchemaRows {
+							if row._type == "table" && row.name == tableName {
+								createSQL = row.sql
+								break
+							}
+						}
+						if createSQL == "" {
+							fmt.Printf("table schema not found: %s\n", tableName)
+							os.Exit(1)
+						}
+						defs := parseCreateTableColumns(createSQL)
+						var payloadCols []string
+						for _, def := range defs {
+							payloadCols = append(payloadCols, def.name)
+						}
+
+						// Count matching rows
+						for _, cellPtr := range cellPointers {
+							_, _ = databaseFile.Seek(pageStart+int64(cellPtr), io.SeekStart)
+							_ = parseVarint(databaseFile)      // payload size
+							rowid := parseVarint(databaseFile) // rowid
+							rec := parserRecordDynamic(databaseFile)
+
+							if evaluateWhereClause(stmt.Where.Expr, payloadCols, rec.values, rowid) {
+								count++
+							}
+						}
+						fmt.Println(count)
+					} else {
+						fmt.Println(pageHeader.numCells)
+					}
 					return
 				}
 			}
@@ -224,6 +266,13 @@ func main() {
 				rowid := parseVarint(databaseFile) // rowid
 
 				rec := parserRecordDynamic(databaseFile)
+
+				// Check WHERE clause if present
+				if stmt.Where != nil {
+					if !evaluateWhereClause(stmt.Where.Expr, payloadCols, rec.values, rowid) {
+						continue // Skip this row
+					}
+				}
 
 				// Print values for all requested columns
 				var values []string
