@@ -9,8 +9,6 @@ import (
 	"github.com/xwb1989/sqlparser"
 )
 
-// ...existing code...
-
 func evaluateWhereClause(expr sqlparser.Expr, columnNames []string, values []interface{}, rowid int) bool {
 	switch e := expr.(type) {
 	case *sqlparser.ComparisonExpr:
@@ -34,9 +32,13 @@ func evaluateComparison(expr *sqlparser.ComparisonExpr, columnNames []string, va
 	leftVal := getExprValue(expr.Left, columnNames, values, rowid)
 	rightVal := getExprValue(expr.Right, columnNames, values, rowid)
 
+	//fmt.Printf("    Comparing: %v (%T) %s %v (%T)\n", leftVal, leftVal, expr.Operator, rightVal, rightVal)
+
 	switch expr.Operator {
 	case sqlparser.EqualStr:
-		return compareValues(leftVal, rightVal) == 0
+		result := compareValues(leftVal, rightVal) == 0
+		//fmt.Printf("    Comparison result: %v\n", result)
+		return result
 	case sqlparser.NotEqualStr:
 		return compareValues(leftVal, rightVal) != 0
 	case sqlparser.LessThanStr:
@@ -57,23 +59,33 @@ func getExprValue(expr sqlparser.Expr, columnNames []string, values []interface{
 	switch e := expr.(type) {
 	case *sqlparser.ColName:
 		colName := e.Name.String()
-		if strings.ToLower(colName) == "rowid" {
+		//fmt.Printf("    Looking for column: %s\n", colName)
+		// Handle rowid/id columns
+		if strings.ToLower(colName) == "rowid" || strings.ToLower(colName) == "id" {
+			fmt.Printf("    Found rowid column: %d\n", rowid)
 			return rowid
 		}
+		// Look for column in the payload columns
 		for i, name := range columnNames {
 			if strings.EqualFold(name, colName) {
-				if i < len(values) {
-					return values[i]
+				// Add 1 to account for the extra null column at the beginning
+				actualIndex := i + 1
+				if actualIndex < len(values) {
+					//fmt.Printf("    Found column %s at payload index %d (actual record index %d): %v (%T)\n", colName, i, actualIndex, values[actualIndex], values[actualIndex])
+					return values[actualIndex]
 				}
 				return nil
 			}
 		}
-		log.Fatalf("Column not found: %s", colName)
+		// If column not found in payload, it might be a rowid column
+		log.Fatalf("Column not found: %s (available: %v)", colName, columnNames)
 		return nil
 	case *sqlparser.SQLVal:
 		switch e.Type {
 		case sqlparser.StrVal:
-			return string(e.Val)
+			result := string(e.Val)
+			//fmt.Printf("    String literal: %s\n", result)
+			return result
 		case sqlparser.IntVal:
 			// Parse integer
 			val := string(e.Val)
@@ -113,6 +125,8 @@ func compareValues(left, right interface{}) int {
 	leftStr := valueToString(left)
 	rightStr := valueToString(right)
 
+	//fmt.Printf("    String comparison: '%s' vs '%s'\n", leftStr, rightStr)
+
 	// Try numeric comparison first
 	if leftNum, leftErr := strconv.ParseFloat(leftStr, 64); leftErr == nil {
 		if rightNum, rightErr := strconv.ParseFloat(rightStr, 64); rightErr == nil {
@@ -127,7 +141,9 @@ func compareValues(left, right interface{}) int {
 	}
 
 	// Fall back to string comparison
-	return strings.Compare(leftStr, rightStr)
+	result := strings.Compare(leftStr, rightStr)
+	//fmt.Printf("    Final string comparison result: %d\n", result)
+	return result
 }
 
 func valueToString(val interface{}) string {
@@ -146,5 +162,3 @@ func valueToString(val interface{}) string {
 		return fmt.Sprintf("%v", v)
 	}
 }
-
-// ...existing code...

@@ -34,6 +34,7 @@ func parserRecordDynamic(stream io.Reader) Record {
 		consumed += n
 	}
 
+	// Don't include the header length as a value - only parse the actual column values
 	values := make([]interface{}, len(serialTypes))
 	for i, serialType := range serialTypes {
 		values[i] = parseRecordValue(stream, serialType)

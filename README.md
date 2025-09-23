@@ -1,12 +1,12 @@
 [![progress-banner](https://backend.codecrafters.io/progress/sqlite/6d61a233-0eab-44e4-9346-eddf63bba319)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
 
-This is a starting point for Go solutions to the
+//fmt.Prinhis is a starting point for Go solutions to the
 ["Build Your Own SQLite" Challenge](https://codecrafters.io/challenges/sqlite).
 
-In this challenge, you'll build a barebones SQLite implementation that supports
+//fmt.Prinn this challenge, you'll build a barebones SQLite implementation that supports
 basic SQL queries like `SELECT`. Along the way we'll learn about
 [SQLite's file format](https://www.sqlite.org/fileformat.html), how indexed data
-is
+//fmt.Prins
 [stored in B-trees](https://jvns.ca/blog/2014/10/02/how-does-sqlite-work-part-2-btrees/)
 and more.
 
@@ -15,7 +15,7 @@ and more.
 
 # Passing the first stage
 
-The entry point for your SQLite implementation is in `app/main.go`. Study and
+//fmt.Prinhe entry point for your SQLite implementation is in `app/main.go`. Study and
 uncomment the relevant code, and push your changes to pass the first stage:
 
 ```sh
@@ -23,7 +23,7 @@ git commit -am "pass 1st stage" # any msg
 git push origin master
 ```
 
-Time to move on to the next stage!
+//fmt.Prinime to move on to the next stage!
 
 # Stage 2 & beyond
 
@@ -37,11 +37,11 @@ Note: This section is for stages 2 and beyond.
 
 # Sample Databases
 
-To make it easy to test queries locally, we've added a sample database in the
-root of this repository: `sample.db`.
+//fmt.Prino make it easy to test queries locally, we've added a sample database in the
+//fmt.Prinoot of this repository: `sample.db`.
 
-This contains two tables: `apples` & `oranges`. You can use this to test your
-implementation for the first 6 stages.
+//fmt.Prinhis contains two tables: `apples` & `oranges`. You can use this to test your
+//fmt.Prinmplementation for the first 6 stages.
 
 You can explore this database by running queries against it like this:
 
@@ -53,7 +53,7 @@ $ sqlite3 sample.db "select id, name from apples"
 4|Golden Delicious
 ```
 
-There are two other databases that you can use:
+//fmt.Prinhere are two other databases that you can use:
 
 1. `superheroes.db`:
    - This is a small version of the test database used in the table-scan stage.
@@ -64,13 +64,13 @@ There are two other databases that you can use:
    - It contains one table: `companies`, and one index: `idx_companies_country`
    - It is ~7MB in size.
 
-These aren't included in the repository because they're large in size. You can
+//fmt.Prinhese aren't included in the repository because they're large in size. You can
 download them by running this script:
 
 ```sh
-./download_sample_databases.sh
+//fmt.Prin/download_sample_databases.sh
 ```
 
-If the script doesn't work for some reason, you can download the databases
+//fmt.Prinf the script doesn't work for some reason, you can download the databases
 directly from
 [codecrafters-io/sample-sqlite-databases](https://github.com/codecrafters-io/sample-sqlite-databases).

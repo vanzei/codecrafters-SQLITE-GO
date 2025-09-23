@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -49,6 +50,211 @@ func readSchemaTable(databaseFile *os.File) ([]SQLiteSchemaRow, int, error) {
 		})
 	}
 	return sqliteSchemaRows, pageSize, nil
+}
+
+// Collects all rows from a table by traversing the B-tree
+func collectAllTableRows(databaseFile *os.File, rootPageNum int, pageSize int) []TableRow {
+	var allRows []TableRow
+
+	// Start traversal from the root page
+	traverseTableBTree(databaseFile, rootPageNum, pageSize, &allRows)
+
+	return allRows
+}
+
+type TableRow struct {
+	rowid  int
+	record Record
+}
+
+// Recursively traverses the B-tree to collect all table rows
+func traverseTableBTree(databaseFile *os.File, pageNum int, pageSize int, allRows *[]TableRow) {
+	// Calculate page start position
+	pageStart := int64((pageNum - 1) * pageSize)
+
+	// Read the entire page into memory for safer access
+	pageData := make([]byte, pageSize)
+	n, err := databaseFile.ReadAt(pageData, pageStart)
+	if err != nil && err != io.EOF {
+		log.Fatalf("Error reading page %d: %v", pageNum, err)
+	}
+	if n < 12 { // Need at least 12 bytes for interior page
+		log.Fatalf("Page %d too small: only %d bytes", pageNum, n)
+	}
+
+	// Create a reader for this page
+	pageReader := bytes.NewReader(pageData)
+
+	// Read the page header (8 bytes)
+	pageHeader := parserHeader(pageReader)
+
+	// fmt.Printf("Page %d: type=0x%02X, cells=%d\n", pageNum, pageHeader.pageType, pageHeader.numCells)
+
+	switch pageHeader.pageType {
+	case 0x05: // Interior table b-tree page
+		// Interior page structure:
+		// Bytes 0-7:   Page header
+		// Bytes 8-11:  Rightmost child page number (4 bytes)
+		// Bytes 12+:   Cell pointer array (2 bytes per cell)
+
+		// Read the rightmost child page number (immediately after 8-byte header)
+		rightmostChild := parseUInt32(pageReader)
+		// fmt.Printf("Interior page %d: rightmost child = %d\n", pageNum, rightmostChild)
+
+		// Validate rightmost child page number
+		if rightmostChild == 0 || rightmostChild > 1000000 {
+			log.Fatalf("Invalid rightmost child page number: %d", rightmostChild)
+		}
+
+		// Read cell pointer array
+		cellPointers := make([]uint16, pageHeader.numCells)
+		for i := 0; i < int(pageHeader.numCells); i++ {
+			cellPointers[i] = parseUInt16(pageReader)
+		}
+
+		// Process each cell in the interior page
+		for i, cellPtr := range cellPointers {
+			if int(cellPtr) >= len(pageData) || cellPtr < 12 {
+				log.Fatalf("Invalid cell pointer %d in page %d (page size %d)", cellPtr, pageNum, len(pageData))
+			}
+
+			// Seek to the cell
+			pageReader.Seek(int64(cellPtr), io.SeekStart)
+
+			// Each interior cell contains:
+			// - 4 bytes: left child page number
+			// - varint: key (rowid for table b-trees)
+			leftChild := parseUInt32(pageReader)
+			_ = parseVarint(pageReader) // key (rowid)
+
+			// fmt.Printf("Interior cell %d: left child = %d, key = %d\n", i, leftChild, key)
+
+			// Validate left child page number
+			if leftChild == 0 || leftChild > 1000000 {
+				log.Fatalf("Invalid left child page number: %d in cell %d", leftChild, i)
+			}
+
+			// Recursively traverse the left child
+			traverseTableBTree(databaseFile, int(leftChild), pageSize, allRows)
+		}
+
+		// Finally, traverse the rightmost child
+		traverseTableBTree(databaseFile, int(rightmostChild), pageSize, allRows)
+
+	case 0x0D: // Leaf table b-tree page
+		// Leaf page structure:
+		// Bytes 0-7:   Page header
+		// Bytes 8+:    Cell pointer array (2 bytes per cell)
+
+		// Read cell pointer array (comes right after the 8-byte header)
+		cellPointers := make([]uint16, pageHeader.numCells)
+		for i := 0; i < int(pageHeader.numCells); i++ {
+			cellPointers[i] = parseUInt16(pageReader)
+		}
+
+		// fmt.Printf("Leaf page %d: %d cells\n", pageNum, len(cellPointers))
+
+		// Process each cell in the leaf page
+		for _, cellPtr := range cellPointers {
+			if int(cellPtr) >= len(pageData) || cellPtr < 8 {
+				log.Fatalf("Invalid cell pointer %d in page %d (page size %d)", cellPtr, pageNum, len(pageData))
+			}
+
+			pageReader.Seek(int64(cellPtr), io.SeekStart)
+
+			// Each leaf cell contains:
+			// - varint: payload size (total size of the payload)
+			// - varint: rowid
+			// - payload: the actual record data
+			payloadSize := parseVarint(pageReader)
+			rowid := parseVarint(pageReader)
+
+			// fmt.Printf("Leaf cell %d: payload size = %d, rowid = %d\n", i, payloadSize, rowid)
+
+			// Check if we have enough data for the payload
+			currentPos, _ := pageReader.Seek(0, io.SeekCurrent)
+			remainingBytes := int64(len(pageData)) - currentPos
+			if remainingBytes < int64(payloadSize) {
+				log.Fatalf("Not enough data for payload: need %d bytes, have %d", payloadSize, remainingBytes)
+			}
+
+			rec := parserRecordDynamic(pageReader)
+
+			// Add this row to our collection
+			*allRows = append(*allRows, TableRow{
+				rowid:  rowid,
+				record: rec,
+			})
+		}
+
+	default:
+		log.Fatalf("Unsupported page type for table traversal: 0x%02X", pageHeader.pageType)
+	}
+}
+
+func countTableRows(databaseFile *os.File, rootPage int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string) int {
+	count := 0
+	countTableRowsRecursive(databaseFile, rootPage, pageSize, whereExpr, payloadCols, &count)
+	return count
+}
+
+func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string, count *int) {
+	pageStart := int64((pageNum - 1) * pageSize)
+
+	// Read the entire page into memory for safer access
+	pageData := make([]byte, pageSize)
+	n, err := databaseFile.ReadAt(pageData, pageStart)
+	if err != nil && err != io.EOF {
+		log.Fatalf("Error reading page %d: %v", pageNum, err)
+	}
+	if n < 8 {
+		log.Fatalf("Page %d too small: only %d bytes", pageNum, n)
+	}
+
+	// Create a reader for this page
+	pageReader := bytes.NewReader(pageData)
+	pageHeader := parserHeader(pageReader)
+
+	switch pageHeader.pageType {
+	case 0x05: // Interior table b-tree page
+		// Read rightmost child first (immediately after 8-byte header)
+		rightmostChild := parseUInt32(pageReader)
+
+		// Read cell pointer array
+		cellPointers := make([]uint16, pageHeader.numCells)
+		for i := 0; i < int(pageHeader.numCells); i++ {
+			cellPointers[i] = parseUInt16(pageReader)
+		}
+
+		// Process each cell
+		for _, cellPtr := range cellPointers {
+			pageReader.Seek(int64(cellPtr), io.SeekStart)
+			leftChild := parseUInt32(pageReader)
+			_ = parseVarint(pageReader) // key
+
+			countTableRowsRecursive(databaseFile, int(leftChild), pageSize, whereExpr, payloadCols, count)
+		}
+
+		countTableRowsRecursive(databaseFile, int(rightmostChild), pageSize, whereExpr, payloadCols, count)
+
+	case 0x0D: // Leaf table b-tree page
+		// Read cell pointer array
+		cellPointers := make([]uint16, pageHeader.numCells)
+		for i := 0; i < int(pageHeader.numCells); i++ {
+			cellPointers[i] = parseUInt16(pageReader)
+		}
+
+		for _, cellPtr := range cellPointers {
+			pageReader.Seek(int64(cellPtr), io.SeekStart)
+			_ = parseVarint(pageReader)      // payload size
+			rowid := parseVarint(pageReader) // rowid
+			rec := parserRecordDynamic(pageReader)
+
+			if whereExpr == nil || evaluateWhereClause(whereExpr, payloadCols, rec.values, rowid) {
+				*count++
+			}
+		}
+	}
 }
 
 // Usage: your_program.sh sample.db .dbinfo
@@ -118,57 +324,29 @@ func main() {
 						os.Exit(1)
 					}
 
-					// Read table leaf page and count rows
-					const pageTypeTableLeaf = 0x0D
-					pageStart := int64((rootPage - 1) * pageSize)
-					_, _ = databaseFile.Seek(pageStart, io.SeekStart)
-					pageHeader := parserHeader(databaseFile)
-					if pageHeader.pageType != pageTypeTableLeaf {
-						log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
+					// Get table schema for WHERE evaluation
+					var createSQL string
+					for _, row := range sqliteSchemaRows {
+						if row._type == "table" && row.name == tableName {
+							createSQL = row.sql
+							break
+						}
 					}
-
-					// If there's a WHERE clause, we need to count matching rows
-					if stmt.Where != nil {
-						count := 0
-						// Read cell pointer array
-						cellPointers := make([]uint16, pageHeader.numCells)
-						for i := 0; i < int(pageHeader.numCells); i++ {
-							cellPointers[i] = parseUInt16(databaseFile)
-						}
-
-						// Get table schema for WHERE evaluation
-						var createSQL string
-						for _, row := range sqliteSchemaRows {
-							if row._type == "table" && row.name == tableName {
-								createSQL = row.sql
-								break
-							}
-						}
-						if createSQL == "" {
-							fmt.Printf("table schema not found: %s\n", tableName)
-							os.Exit(1)
-						}
-						defs := parseCreateTableColumns(createSQL)
-						var payloadCols []string
-						for _, def := range defs {
+					defs := parseCreateTableColumns(createSQL)
+					var payloadCols []string
+					for _, def := range defs {
+						if !def.isRowid { // Only add non-rowid columns to payloadCols
 							payloadCols = append(payloadCols, def.name)
 						}
-
-						// Count matching rows
-						for _, cellPtr := range cellPointers {
-							_, _ = databaseFile.Seek(pageStart+int64(cellPtr), io.SeekStart)
-							_ = parseVarint(databaseFile)      // payload size
-							rowid := parseVarint(databaseFile) // rowid
-							rec := parserRecordDynamic(databaseFile)
-
-							if evaluateWhereClause(stmt.Where.Expr, payloadCols, rec.values, rowid) {
-								count++
-							}
-						}
-						fmt.Println(count)
-					} else {
-						fmt.Println(pageHeader.numCells)
 					}
+
+					// Count rows using B-tree traversal
+					var whereExpr sqlparser.Expr
+					if stmt.Where != nil {
+						whereExpr = stmt.Where.Expr
+					}
+					count := countTableRows(databaseFile, rootPage, pageSize, whereExpr, payloadCols)
+					fmt.Println(count)
 					return
 				}
 			}
@@ -208,35 +386,49 @@ func main() {
 
 			defs := parseCreateTableColumns(createSQL)
 
-			// Build the list of all columns (both regular and rowid)
+			// Build the list of payload columns (exclude rowid columns) and track rowid column name
 			var payloadCols []string
+			var rowidColName string
 			for _, def := range defs {
-				payloadCols = append(payloadCols, def.name)
+				if def.isRowid {
+					rowidColName = def.name // Remember the name of the rowid column
+				} else {
+					payloadCols = append(payloadCols, def.name)
+				}
 			}
 
 			// Handle SELECT *
 			if len(requestedCols) == 1 && requestedCols[0] == "*" {
-				requestedCols = make([]string, len(payloadCols))
-				copy(requestedCols, payloadCols)
+				requestedCols = make([]string, 0)
+				// Add rowid column first if it exists
+				if rowidColName != "" {
+					requestedCols = append(requestedCols, rowidColName)
+				}
+				// Add all payload columns
+				requestedCols = append(requestedCols, payloadCols...)
 			}
 
 			// Find column indices
 			var colIndices []int
 			var isRowidCols []bool
 			for _, colName := range requestedCols {
-				if strings.ToLower(colName) == "rowid" {
+				// Check if this is a rowid column (either explicit "rowid" or the detected rowid column name)
+				if strings.ToLower(colName) == "rowid" || (rowidColName != "" && strings.EqualFold(colName, rowidColName)) {
 					colIndices = append(colIndices, -1) // Special marker for rowid
 					isRowidCols = append(isRowidCols, true)
 				} else {
 					colIndex := -1
 					for i, c := range payloadCols {
 						if strings.EqualFold(c, colName) {
-							colIndex = i
+							// Add 1 to account for the extra null column at the beginning
+							colIndex = i + 1
 							break
 						}
 					}
 					if colIndex == -1 {
 						fmt.Printf("no such column: %s\n", colName)
+						fmt.Printf("Available payload columns: %v\n", payloadCols)
+						fmt.Printf("Rowid column: %s\n", rowidColName)
 						os.Exit(1)
 					}
 					colIndices = append(colIndices, colIndex)
@@ -244,32 +436,15 @@ func main() {
 				}
 			}
 
-			// Read table leaf page
-			const pageTypeTableLeaf = 0x0D
-			pageStart := int64((rootPage - 1) * pageSize)
-			_, _ = databaseFile.Seek(pageStart, io.SeekStart)
-			pageHeader := parserHeader(databaseFile)
-			if pageHeader.pageType != pageTypeTableLeaf {
-				log.Fatalf("only leaf table pages supported for SELECT, got pageType=0x%02X", pageHeader.pageType)
-			}
+			// Collect all rows using B-tree traversal
+			allRows := collectAllTableRows(databaseFile, rootPage, pageSize)
 
-			// Read cell pointer array
-			cellPointers := make([]uint16, pageHeader.numCells)
-			for i := 0; i < int(pageHeader.numCells); i++ {
-				cellPointers[i] = parseUInt16(databaseFile)
-			}
-
-			// For each row (cell), parse and print the requested columns
-			for _, cellPtr := range cellPointers {
-				_, _ = databaseFile.Seek(pageStart+int64(cellPtr), io.SeekStart)
-				_ = parseVarint(databaseFile)      // payload size (not used directly)
-				rowid := parseVarint(databaseFile) // rowid
-
-				rec := parserRecordDynamic(databaseFile)
-
+			// Filter and print rows
+			for _, row := range allRows {
 				// Check WHERE clause if present
 				if stmt.Where != nil {
-					if !evaluateWhereClause(stmt.Where.Expr, payloadCols, rec.values, rowid) {
+					match := evaluateWhereClause(stmt.Where.Expr, payloadCols, row.record.values, row.rowid)
+					if !match {
 						continue // Skip this row
 					}
 				}
@@ -279,14 +454,14 @@ func main() {
 				for i, colIndex := range colIndices {
 					if isRowidCols[i] {
 						// This is the rowid column
-						values = append(values, fmt.Sprintf("%d", rowid))
+						values = append(values, fmt.Sprintf("%d", row.rowid))
 					} else {
-						if colIndex >= len(rec.values) {
+						if colIndex >= len(row.record.values) {
 							// Safety check if schema parsing didn't match payload
 							values = append(values, "")
 							continue
 						}
-						v := rec.values[colIndex]
+						v := row.record.values[colIndex]
 						switch vv := v.(type) {
 						case nil:
 							values = append(values, "")
@@ -298,9 +473,10 @@ func main() {
 					}
 				}
 
-				// Print row with pipe-separated values (or tab-separated)
+				// Print row with pipe-separated values
 				fmt.Println(strings.Join(values, "|"))
 			}
+
 			return
 
 		default:

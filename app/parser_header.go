@@ -1,10 +1,10 @@
 package main
 
 import (
-	"os"
+	"io"
 )
 
-type PageHearder struct {
+type PageHeader struct {
 	pageType    uint8
 	firstFree   uint16
 	numCells    uint16
@@ -12,15 +12,15 @@ type PageHearder struct {
 	fragmented  uint8
 }
 
-func parserHeader(databaseFile *os.File) PageHearder {
+func parserHeader(stream io.Reader) PageHeader {
 
-	pageType := parseUInt8(databaseFile)
-	firstFree := parseUInt16(databaseFile)
-	numCells := parseUInt16(databaseFile)
-	startOfCell := parseUInt16(databaseFile)
-	fragmented := parseUInt8(databaseFile)
+	pageType := parseUInt8(stream)
+	firstFree := parseUInt16(stream)
+	numCells := parseUInt16(stream)
+	startOfCell := parseUInt16(stream)
+	fragmented := parseUInt8(stream)
 
-	return PageHearder{
+	return PageHeader{
 		pageType:    pageType,
 		firstFree:   firstFree,
 		numCells:    numCells,
