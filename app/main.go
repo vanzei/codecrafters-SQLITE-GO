@@ -283,6 +283,183 @@ func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, w
 	}
 }
 
+func extractRowValues(rec Record, rowid int, colIndices []int, isRowidCols []bool) []string {
+	values := make([]string, 0, len(colIndices))
+	for i, colIndex := range colIndices {
+		if isRowidCols[i] {
+			values = append(values, fmt.Sprintf("%d", rowid))
+			continue
+		}
+		if colIndex >= len(rec.values) {
+			values = append(values, "")
+			continue
+		}
+		v := rec.values[colIndex]
+		switch vv := v.(type) {
+		case nil:
+			values = append(values, "")
+		case []byte:
+			values = append(values, string(vv))
+		default:
+			values = append(values, fmt.Sprintf("%v", vv))
+		}
+	}
+	return values
+}
+
+func extractEqualityValue(expr sqlparser.Expr, column string) (string, bool) {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator != sqlparser.EqualStr {
+			return "", false
+		}
+		if col, ok := e.Left.(*sqlparser.ColName); ok && strings.EqualFold(col.Name.String(), column) {
+			return literalToString(e.Right)
+		}
+		if col, ok := e.Right.(*sqlparser.ColName); ok && strings.EqualFold(col.Name.String(), column) {
+			return literalToString(e.Left)
+		}
+	case *sqlparser.AndExpr:
+		if v, ok := extractEqualityValue(e.Left, column); ok {
+			return v, true
+		}
+		return extractEqualityValue(e.Right, column)
+	}
+	return "", false
+}
+
+func literalToString(expr sqlparser.Expr) (string, bool) {
+	switch v := expr.(type) {
+	case *sqlparser.SQLVal:
+		switch v.Type {
+		case sqlparser.StrVal, sqlparser.IntVal:
+			return string(v.Val), true
+		}
+	}
+	return "", false
+}
+
+func searchIndexForValue(databaseFile *os.File, indexRoot int, pageSize int, target string) []int {
+	var rowids []int
+	traverseIndexBTree(databaseFile, indexRoot, pageSize, target, &rowids)
+	return rowids
+}
+
+func traverseIndexBTree(databaseFile *os.File, pageNum int, pageSize int, target string, rowids *[]int) {
+	pageStart := int64((pageNum - 1) * pageSize)
+	pageData := make([]byte, pageSize)
+	n, err := databaseFile.ReadAt(pageData, pageStart)
+	if err != nil && err != io.EOF {
+		log.Fatalf("Error reading index page %d: %v", pageNum, err)
+	}
+	if n < 8 {
+		log.Fatalf("Index page %d too small: only %d bytes", pageNum, n)
+	}
+
+	reader := bytes.NewReader(pageData)
+	header := parserHeader(reader)
+
+	switch header.pageType {
+	case 0x02: // Interior index page
+		rightmostChild := parseUInt32(reader)
+		cellPointers := make([]uint16, header.numCells)
+		for i := 0; i < int(header.numCells); i++ {
+			cellPointers[i] = parseUInt16(reader)
+		}
+
+		for _, cellPtr := range cellPointers {
+			reader.Seek(int64(cellPtr), io.SeekStart)
+			leftChild := parseUInt32(reader)
+			payloadSize := parseVarint(reader)
+			rec := parserRecordDynamic(io.LimitReader(reader, int64(payloadSize)))
+			if len(rec.values) == 0 {
+				continue
+			}
+			keyVal := valueToString(rec.values[0])
+			_ = keyVal
+			traverseIndexBTree(databaseFile, int(leftChild), pageSize, target, rowids)
+		}
+		traverseIndexBTree(databaseFile, int(rightmostChild), pageSize, target, rowids)
+	case 0x0A: // Leaf index page
+		cellPointers := make([]uint16, header.numCells)
+		for i := 0; i < int(header.numCells); i++ {
+			cellPointers[i] = parseUInt16(reader)
+		}
+		for _, cellPtr := range cellPointers {
+			reader.Seek(int64(cellPtr), io.SeekStart)
+			payloadSize := parseVarint(reader) // payload size
+			rec := parserRecordDynamic(io.LimitReader(reader, int64(payloadSize)))
+			if len(rec.values) == 0 {
+				continue
+			}
+			keyVal := valueToString(rec.values[0])
+			if keyVal == target {
+				rowidVal := rec.values[len(rec.values)-1]
+				*rowids = append(*rowids, toInt(rowidVal))
+			} else if strings.Compare(keyVal, target) > 0 {
+				break
+			}
+		}
+	default:
+		log.Fatalf("Unsupported index page type: 0x%02X", header.pageType)
+	}
+}
+
+func fetchTableRowByRowid(databaseFile *os.File, pageNum int, pageSize int, targetRowid int) (Record, bool) {
+	pageStart := int64((pageNum - 1) * pageSize)
+	pageData := make([]byte, pageSize)
+	n, err := databaseFile.ReadAt(pageData, pageStart)
+	if err != nil && err != io.EOF {
+		log.Fatalf("Error reading table page %d: %v", pageNum, err)
+	}
+	if n < 8 {
+		return Record{}, false
+	}
+
+	reader := bytes.NewReader(pageData)
+	header := parserHeader(reader)
+
+	switch header.pageType {
+	case 0x05: // Interior table page
+		rightmostChild := parseUInt32(reader)
+		cellPointers := make([]uint16, header.numCells)
+		for i := 0; i < int(header.numCells); i++ {
+			cellPointers[i] = parseUInt16(reader)
+		}
+
+		for _, cellPtr := range cellPointers {
+			reader.Seek(int64(cellPtr), io.SeekStart)
+			leftChild := parseUInt32(reader)
+			key := parseVarint(reader)
+			if targetRowid <= key {
+				return fetchTableRowByRowid(databaseFile, int(leftChild), pageSize, targetRowid)
+			}
+		}
+		return fetchTableRowByRowid(databaseFile, int(rightmostChild), pageSize, targetRowid)
+
+	case 0x0D: // Leaf table page
+		cellPointers := make([]uint16, header.numCells)
+		for i := 0; i < int(header.numCells); i++ {
+			cellPointers[i] = parseUInt16(reader)
+		}
+		for _, cellPtr := range cellPointers {
+			reader.Seek(int64(cellPtr), io.SeekStart)
+			_ = parseVarint(reader)      // payload size
+			rowid := parseVarint(reader) // rowid
+			if rowid == targetRowid {
+				rec := parserRecordDynamic(reader)
+				return rec, true
+			}
+			if rowid > targetRowid {
+				break
+			}
+		}
+		return Record{}, false
+	default:
+		return Record{}, false
+	}
+}
+
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
@@ -437,6 +614,20 @@ func main() {
 				}
 			}
 
+			// Optional: find index on country and country value from WHERE clause
+			var indexRoot int
+			for _, row := range sqliteSchemaRows {
+				if row._type == "index" && row.tblName == tableName && row.name == "idx_companies_country" {
+					indexRoot = row.rootPage
+					break
+				}
+			}
+			var countryValue string
+			var hasCountryFilter bool
+			if stmt.Where != nil {
+				countryValue, hasCountryFilter = extractEqualityValue(stmt.Where.Expr, "country")
+			}
+
 			// Handle SELECT *
 			if len(requestedCols) == 1 && requestedCols[0] == "*" {
 				requestedCols = make([]string, 0)
@@ -469,6 +660,25 @@ func main() {
 				}
 			}
 
+			if indexRoot != 0 && hasCountryFilter {
+				rowids := searchIndexForValue(databaseFile, indexRoot, pageSize, countryValue)
+				seen := make(map[int]bool)
+				for _, rowid := range rowids {
+					if seen[rowid] {
+						continue
+					}
+					seen[rowid] = true
+
+					rec, ok := fetchTableRowByRowid(databaseFile, rootPage, pageSize, rowid)
+					if !ok {
+						continue
+					}
+					values := extractRowValues(rec, rowid, colIndices, isRowidCols)
+					fmt.Println(strings.Join(values, "|"))
+				}
+				return
+			}
+
 			// Collect all rows using B-tree traversal
 			allRows := collectAllTableRows(databaseFile, rootPage, pageSize)
 
@@ -482,31 +692,7 @@ func main() {
 					}
 				}
 
-				// Print values for all requested columns
-				var values []string
-				for i, colIndex := range colIndices {
-					if isRowidCols[i] {
-						// This is the rowid column
-						values = append(values, fmt.Sprintf("%d", row.rowid))
-					} else {
-						if colIndex >= len(row.record.values) {
-							// Safety check if schema parsing didn't match payload
-							values = append(values, "")
-							continue
-						}
-						v := row.record.values[colIndex]
-						switch vv := v.(type) {
-						case nil:
-							values = append(values, "")
-						case []byte:
-							values = append(values, string(vv))
-						default:
-							values = append(values, fmt.Sprintf("%v", vv))
-						}
-					}
-				}
-
-				// Print row with pipe-separated values
+				values := extractRowValues(row.record, row.rowid, colIndices, isRowidCols)
 				fmt.Println(strings.Join(values, "|"))
 			}
 
