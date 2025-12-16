@@ -9,28 +9,28 @@ import (
 	"github.com/xwb1989/sqlparser"
 )
 
-func evaluateWhereClause(expr sqlparser.Expr, columnNames []string, values []interface{}, rowid int) bool {
+func evaluateWhereClause(expr sqlparser.Expr, columnIndex map[string]int, columnNames []string, rowidColName string, values []interface{}, rowid int) bool {
 	switch e := expr.(type) {
 	case *sqlparser.ComparisonExpr:
-		return evaluateComparison(e, columnNames, values, rowid)
+		return evaluateComparison(e, columnIndex, columnNames, rowidColName, values, rowid)
 	case *sqlparser.AndExpr:
-		return evaluateWhereClause(e.Left, columnNames, values, rowid) &&
-			evaluateWhereClause(e.Right, columnNames, values, rowid)
+		return evaluateWhereClause(e.Left, columnIndex, columnNames, rowidColName, values, rowid) &&
+			evaluateWhereClause(e.Right, columnIndex, columnNames, rowidColName, values, rowid)
 	case *sqlparser.OrExpr:
-		return evaluateWhereClause(e.Left, columnNames, values, rowid) ||
-			evaluateWhereClause(e.Right, columnNames, values, rowid)
+		return evaluateWhereClause(e.Left, columnIndex, columnNames, rowidColName, values, rowid) ||
+			evaluateWhereClause(e.Right, columnIndex, columnNames, rowidColName, values, rowid)
 	case *sqlparser.ParenExpr:
-		return evaluateWhereClause(e.Expr, columnNames, values, rowid)
+		return evaluateWhereClause(e.Expr, columnIndex, columnNames, rowidColName, values, rowid)
 	default:
 		log.Fatalf("Unsupported WHERE expression type: %T", expr)
 		return false
 	}
 }
 
-func evaluateComparison(expr *sqlparser.ComparisonExpr, columnNames []string, values []interface{}, rowid int) bool {
+func evaluateComparison(expr *sqlparser.ComparisonExpr, columnIndex map[string]int, columnNames []string, rowidColName string, values []interface{}, rowid int) bool {
 	// Get left operand value
-	leftVal := getExprValue(expr.Left, columnNames, values, rowid)
-	rightVal := getExprValue(expr.Right, columnNames, values, rowid)
+	leftVal := getExprValue(expr.Left, columnIndex, columnNames, rowidColName, values, rowid)
+	rightVal := getExprValue(expr.Right, columnIndex, columnNames, rowidColName, values, rowid)
 
 	//fmt.Printf("    Comparing: %v (%T) %s %v (%T)\n", leftVal, leftVal, expr.Operator, rightVal, rightVal)
 
@@ -55,27 +55,20 @@ func evaluateComparison(expr *sqlparser.ComparisonExpr, columnNames []string, va
 	}
 }
 
-func getExprValue(expr sqlparser.Expr, columnNames []string, values []interface{}, rowid int) interface{} {
+func getExprValue(expr sqlparser.Expr, columnIndex map[string]int, columnNames []string, rowidColName string, values []interface{}, rowid int) interface{} {
 	switch e := expr.(type) {
 	case *sqlparser.ColName:
 		colName := e.Name.String()
-		//fmt.Printf("    Looking for column: %s\n", colName)
-		// Handle rowid/id columns
-		if strings.ToLower(colName) == "rowid" || strings.ToLower(colName) == "id" {
-			fmt.Printf("    Found rowid column: %d\n", rowid)
+
+		// Handle rowid or INTEGER PRIMARY KEY column
+		if strings.EqualFold(colName, "rowid") || (rowidColName != "" && strings.EqualFold(colName, rowidColName)) {
 			return rowid
 		}
-		// Look for column in the payload columns
-		for i, name := range columnNames {
-			if strings.EqualFold(name, colName) {
-				// Add 1 to account for the extra null column at the beginning
-				actualIndex := i + 1
-				if actualIndex < len(values) {
-					//fmt.Printf("    Found column %s at payload index %d (actual record index %d): %v (%T)\n", colName, i, actualIndex, values[actualIndex], values[actualIndex])
-					return values[actualIndex]
-				}
-				return nil
+		if idx, ok := columnIndex[strings.ToLower(colName)]; ok {
+			if idx < len(values) {
+				return values[idx]
 			}
+			return nil
 		}
 		// If column not found in payload, it might be a rowid column
 		log.Fatalf("Column not found: %s (available: %v)", colName, columnNames)
@@ -154,6 +147,8 @@ func valueToString(val interface{}) string {
 		return string(v)
 	case int:
 		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
 	case uint64:
 		return strconv.FormatUint(v, 10)
 	case float64:

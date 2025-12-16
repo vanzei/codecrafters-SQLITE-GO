@@ -49,31 +49,31 @@ func parseRecordValue(stream io.Reader, serialType int) interface{} {
 		return nil
 	case 1:
 		// 8-bit twos-complement integer
-		return parseUInt8(stream)
+		return parseSignedInt(stream, 1)
 	case 2:
 		// Big-endian 16-bit twos-complement integer
-		return parseUInt16(stream)
+		return parseSignedInt(stream, 2)
 	case 3:
 		// Big-endian 24-bit twos-complement integer
-		return parseUInt24(stream)
+		return parseSignedInt(stream, 3)
 	case 4:
 		// Big-endian 32-bit twos-complement integer
-		return parseUInt32(stream)
+		return parseSignedInt(stream, 4)
 	case 5:
 		// Big-endian 48-bit twos-complement integer
-		return parseUInt48(stream)
+		return parseSignedInt(stream, 6)
 	case 6:
 		// Big-endian 64-bit twos-complement integer
-		return parseUInt64(stream)
+		return parseSignedInt(stream, 8)
 	case 7:
 		// Big-endian IEEE 754-2008 64-bit floating point number
 		return parseFloat64(stream)
 	case 8:
 		// Integer constant 0
-		return uint64(0)
+		return int64(0)
 	case 9:
 		// Integer constant 1
-		return uint64(1)
+		return int64(1)
 	default:
 		if serialType >= 12 && serialType%2 == 0 {
 			// BLOB that is (N-12)/2 bytes in length
@@ -92,4 +92,27 @@ func parseRecordValue(stream io.Reader, serialType int) interface{} {
 			return nil
 		}
 	}
+}
+
+func parseSignedInt(stream io.Reader, byteCount int) int64 {
+	buf := make([]byte, byteCount)
+	n, err := io.ReadFull(stream, buf)
+	if err != nil {
+		log.Fatalf("Error when reading %d-byte signed int: %v", byteCount, err)
+	}
+	if n != byteCount {
+		log.Fatalf("Short read when reading %d-byte signed int: %d", byteCount, n)
+	}
+
+	var result int64
+	for _, b := range buf {
+		result = (result << 8) | int64(b)
+	}
+
+	// Apply two's complement sign extension
+	signBit := uint(8*byteCount - 1)
+	if (result>>signBit)&1 == 1 {
+		result -= 1 << (8 * byteCount)
+	}
+	return result
 }

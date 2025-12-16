@@ -45,7 +45,7 @@ func readSchemaTable(databaseFile *os.File) ([]SQLiteSchemaRow, int, error) {
 			_type:    string(record.values[0].([]byte)),
 			name:     string(record.values[1].([]byte)),
 			tblName:  string(record.values[2].([]byte)),
-			rootPage: int(record.values[3].(uint8)),
+			rootPage: toInt(record.values[3]),
 			sql:      string(record.values[4].([]byte)),
 		})
 	}
@@ -65,6 +65,32 @@ func collectAllTableRows(databaseFile *os.File, rootPageNum int, pageSize int) [
 type TableRow struct {
 	rowid  int
 	record Record
+}
+
+func toInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int8:
+		return int(n)
+	case int16:
+		return int(n)
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case uint8:
+		return int(n)
+	case uint16:
+		return int(n)
+	case uint32:
+		return int(n)
+	case uint64:
+		return int(n)
+	default:
+		log.Fatalf("unexpected integer type %T", v)
+		return 0
+	}
 }
 
 // Recursively traverses the B-tree to collect all table rows
@@ -192,13 +218,13 @@ func traverseTableBTree(databaseFile *os.File, pageNum int, pageSize int, allRow
 	}
 }
 
-func countTableRows(databaseFile *os.File, rootPage int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string) int {
+func countTableRows(databaseFile *os.File, rootPage int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string, payloadIndex map[string]int, rowidColName string) int {
 	count := 0
-	countTableRowsRecursive(databaseFile, rootPage, pageSize, whereExpr, payloadCols, &count)
+	countTableRowsRecursive(databaseFile, rootPage, pageSize, whereExpr, payloadCols, payloadIndex, rowidColName, &count)
 	return count
 }
 
-func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string, count *int) {
+func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, whereExpr sqlparser.Expr, payloadCols []string, payloadIndex map[string]int, rowidColName string, count *int) {
 	pageStart := int64((pageNum - 1) * pageSize)
 
 	// Read the entire page into memory for safer access
@@ -232,10 +258,10 @@ func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, w
 			leftChild := parseUInt32(pageReader)
 			_ = parseVarint(pageReader) // key
 
-			countTableRowsRecursive(databaseFile, int(leftChild), pageSize, whereExpr, payloadCols, count)
+			countTableRowsRecursive(databaseFile, int(leftChild), pageSize, whereExpr, payloadCols, payloadIndex, rowidColName, count)
 		}
 
-		countTableRowsRecursive(databaseFile, int(rightmostChild), pageSize, whereExpr, payloadCols, count)
+		countTableRowsRecursive(databaseFile, int(rightmostChild), pageSize, whereExpr, payloadCols, payloadIndex, rowidColName, count)
 
 	case 0x0D: // Leaf table b-tree page
 		// Read cell pointer array
@@ -250,7 +276,7 @@ func countTableRowsRecursive(databaseFile *os.File, pageNum int, pageSize int, w
 			rowid := parseVarint(pageReader) // rowid
 			rec := parserRecordDynamic(pageReader)
 
-			if whereExpr == nil || evaluateWhereClause(whereExpr, payloadCols, rec.values, rowid) {
+			if whereExpr == nil || evaluateWhereClause(whereExpr, payloadIndex, payloadCols, rowidColName, rec.values, rowid) {
 				*count++
 			}
 		}
@@ -309,9 +335,7 @@ func main() {
 
 			// Handle COUNT(*) special case
 			if len(stmt.SelectExprs) == 1 {
-				colExpr := stmt.SelectExprs[0]
-				colName := sqlparser.String(colExpr.(*sqlparser.AliasedExpr).Expr)
-				if strings.ToUpper(colName) == "COUNT(*)" {
+				if aliasedExpr, ok := stmt.SelectExprs[0].(*sqlparser.AliasedExpr); ok && strings.ToUpper(sqlparser.String(aliasedExpr.Expr)) == "COUNT(*)" {
 					var rootPage int
 					for _, row := range sqliteSchemaRows {
 						if row._type == "table" && row.name == tableName {
@@ -333,10 +357,21 @@ func main() {
 						}
 					}
 					defs := parseCreateTableColumns(createSQL)
-					var payloadCols []string
+					var (
+						payloadCols  []string
+						rowidColName string
+						payloadIndex map[string]int
+					)
+					payloadIndex = make(map[string]int)
+					recordIndex := 0
 					for _, def := range defs {
-						if !def.isRowid { // Only add non-rowid columns to payloadCols
+						if def.isRowid {
+							rowidColName = def.name
+							recordIndex++
+						} else {
 							payloadCols = append(payloadCols, def.name)
+							payloadIndex[strings.ToLower(def.name)] = recordIndex
+							recordIndex++
 						}
 					}
 
@@ -345,7 +380,7 @@ func main() {
 					if stmt.Where != nil {
 						whereExpr = stmt.Where.Expr
 					}
-					count := countTableRows(databaseFile, rootPage, pageSize, whereExpr, payloadCols)
+					count := countTableRows(databaseFile, rootPage, pageSize, whereExpr, payloadCols, payloadIndex, rowidColName)
 					fmt.Println(count)
 					return
 				}
@@ -389,11 +424,16 @@ func main() {
 			// Build the list of payload columns (exclude rowid columns) and track rowid column name
 			var payloadCols []string
 			var rowidColName string
+			payloadIndex := make(map[string]int)
+			recordIndex := 0
 			for _, def := range defs {
 				if def.isRowid {
 					rowidColName = def.name // Remember the name of the rowid column
+					recordIndex++
 				} else {
 					payloadCols = append(payloadCols, def.name)
+					payloadIndex[strings.ToLower(def.name)] = recordIndex
+					recordIndex++
 				}
 			}
 
@@ -417,15 +457,8 @@ func main() {
 					colIndices = append(colIndices, -1) // Special marker for rowid
 					isRowidCols = append(isRowidCols, true)
 				} else {
-					colIndex := -1
-					for i, c := range payloadCols {
-						if strings.EqualFold(c, colName) {
-							// Add 1 to account for the extra null column at the beginning
-							colIndex = i + 1
-							break
-						}
-					}
-					if colIndex == -1 {
+					colIndex, ok := payloadIndex[strings.ToLower(colName)]
+					if !ok {
 						fmt.Printf("no such column: %s\n", colName)
 						fmt.Printf("Available payload columns: %v\n", payloadCols)
 						fmt.Printf("Rowid column: %s\n", rowidColName)
@@ -443,7 +476,7 @@ func main() {
 			for _, row := range allRows {
 				// Check WHERE clause if present
 				if stmt.Where != nil {
-					match := evaluateWhereClause(stmt.Where.Expr, payloadCols, row.record.values, row.rowid)
+					match := evaluateWhereClause(stmt.Where.Expr, payloadIndex, payloadCols, rowidColName, row.record.values, row.rowid)
 					if !match {
 						continue // Skip this row
 					}
